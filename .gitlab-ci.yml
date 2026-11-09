@@ -1,0 +1,184 @@
+# The old pipeline was a single deploy stage that ran `docker compose up --build -d`
+# on the production host and then `docker compose ps` — which proves the containers
+# were *created*, not that they work. A compile error took prod down mid-deploy.
+# These gates run before anything is deployed, and the smoke check actually fails.
+#
+# Everything runs inside containers rather than on the runner host: the box has
+# Node 18, and this app needs 24 (Next 16, Vitest 4). The `builder` stage already
+# has the right Node and the full dependency tree, so the checks run there
+# instead of depending on whatever is installed on the machine.
+#
+# The database, auth and photo storage live in the Supabase project now. The
+# only thing this pipeline still provisions on the host is the basemap, which
+# deliberately did not move.
+
+stages:
+  - verify
+  - deploy
+
+default:
+  tags:
+    # Owner-managed deployment runner. Forks must supply their own runner tag.
+    - hubnew-apps
+
+variables:
+  # Basemap. Lives outside the runner's build dir so `git clean` between jobs
+  # can't wipe a 17GB download.
+  TILES_DIR: /home/apps/data/pmtiles
+  TILES_FILE: world.pmtiles
+  TILES_REGION: 'the whole globe'
+  TILES_BBOX: '-180,-85,180,85'
+  # Zoom is what the globe costs: 17GB at z12, 35GB at z13, 68GB at z14.
+  # `pmtiles extract --dry-run` prices any change before you pay for it.
+  TILES_MAXZOOM: '12'
+  PMTILES_CLI_VERSION: '1.31.1'
+  # Protomaps' weekly planet build. Bump for fresher map data; an old basemap is
+  # out of date, not broken.
+  PLANET_URL: https://build.protomaps.com/20260713.pmtiles
+
+# ─── Gates ────────────────────────────────────────────────────────────────────
+
+verify:
+  stage: verify
+  script:
+    - docker build --target builder -t gratitude-verify:$CI_COMMIT_SHORT_SHA .
+    - |
+      # No disposable Postgres any more. The suite that needed one tested
+      # `visiblePostsWhere` and Prisma pagination; both now live in the database
+      # as RLS policies, and are covered by the e2e tests against a real stack.
+      # What runs here is lint, types, and the pure-logic units — no database,
+      # no network, nothing to tear down.
+      docker run --rm gratitude-verify:$CI_COMMIT_SHORT_SHA \
+        sh -c "npm run lint && npm run typecheck && npm run test"
+  after_script:
+    - docker rmi "gratitude-verify:$CI_COMMIT_SHORT_SHA" >/dev/null 2>&1 || true
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+# ─── Deploy ───────────────────────────────────────────────────────────────────
+
+deploy:
+  stage: deploy
+  needs: ['verify']
+  script:
+    - |
+      # Set these as masked CI variables. NEXT_PUBLIC_* are inlined into the
+      # client bundle at build time and are meant to be public; SUPABASE_SECRET_KEY
+      # bypasses RLS and is server-only — it must never gain a NEXT_PUBLIC_ prefix.
+      : "${NEXT_PUBLIC_SUPABASE_URL:?set NEXT_PUBLIC_SUPABASE_URL as a CI variable}"
+      : "${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:?set NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY as a CI variable}"
+      : "${SUPABASE_SECRET_KEY:?set SUPABASE_SECRET_KEY as a CI variable}"
+      cat > .env << EOF
+      NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+      SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY}
+      TILES_DIR=${TILES_DIR}
+      EOF
+    - |
+      # ─── Basemap provisioning (idempotent) ─────────────────────────────────
+      # The .pmtiles archive can't ship via git (gitignored) or the image
+      # (.dockerignore keeps it out of the build context — 17GB in the context
+      # would hang the daemon). So it's a host file, bind-mounted read-only,
+      # fetched once here.
+      #
+      # `pmtiles extract` reads the remote planet build over HTTP range requests
+      # and pulls only the tiles inside the bbox and zoom range: ~17GB
+      # transferred, not the full 137GB planet.
+      mkdir -p "$TILES_DIR"
+
+      # An interrupted extract does not fail. It leaves a file of exactly the
+      # right length whose missing regions are holes that read back as zeros:
+      # right size, valid header, `pmtiles verify` passes in milliseconds because
+      # it only reads the header and directories. Downstream, MapLibre asks for a
+      # tile, gets zeros, gzip refuses them, and the map renders grey with no
+      # error anyone can act on. That shipped once and cost an evening to find.
+      # So: never trust this file's existence — read it back.
+      check_basemap() {
+        f="$1"
+        [ -f "$f" ] || return 1
+        size=$(stat -c %s "$f"); alloc=$(( $(stat -c %b "$f") * 512 ))
+        # A sparse file reports its full length while occupying far fewer blocks.
+        # That gap is the part of the download that never arrived.
+        if [ "$alloc" -lt $(( size / 100 * 99 )) ]; then
+          echo "  ✗ incomplete: $(( size / 1000000000 ))GB claimed, $(( alloc / 1000000000 ))GB written"
+          return 1
+        fi
+        # Read real tiles back. The CLI hands over whatever is on disk without
+        # judging it, so a hole arrives looking like a successful read of the
+        # right length — gzip magic is the only tell.
+        # Land tiles spread across the zoom range, each verified to exist in a
+        # z0–12 global extract. `od`, not `xxd`: coreutils is always there,
+        # vim-common is not.
+        for t in "2 1 1" "6 31 20" "10 499 321" "12 2047 1362"; do
+          set -- $t
+          magic=$("$TILES_DIR/pmtiles" tile "$f" "$1" "$2" "$3" 2>/dev/null | head -c 2 | od -A n -t x1 | tr -d ' \n')
+          if [ "$magic" != "1f8b" ]; then
+            echo "  ✗ tile z$1/$2/$3 reads back as zeros — the archive has holes"
+            return 1
+          fi
+        done
+        return 0
+      }
+
+      if [ ! -x "$TILES_DIR/pmtiles" ]; then
+        curl -sL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_CLI_VERSION}/go-pmtiles_${PMTILES_CLI_VERSION}_Linux_x86_64.tar.gz" \
+          | tar xz -C "$TILES_DIR" pmtiles
+        chmod +x "$TILES_DIR/pmtiles"
+      fi
+
+      if check_basemap "$TILES_DIR/$TILES_FILE"; then
+        echo "Basemap present and reads back clean: $(du -h "$TILES_DIR/$TILES_FILE" | cut -f1)"
+      else
+        echo "Fetching ${TILES_REGION} at z0–${TILES_MAXZOOM} (one-time, ~17GB)…"
+        rm -f "$TILES_DIR/$TILES_FILE.partial"
+        # Temp name + move, so a failed run can never leave a half-archive in place.
+        "$TILES_DIR/pmtiles" extract "$PLANET_URL" "$TILES_DIR/$TILES_FILE.partial" \
+          --bbox="$TILES_BBOX" --maxzoom="$TILES_MAXZOOM"
+        mv "$TILES_DIR/$TILES_FILE.partial" "$TILES_DIR/$TILES_FILE"
+        if ! check_basemap "$TILES_DIR/$TILES_FILE"; then
+          echo "FATAL: the extract finished but the archive is unusable (see above)."
+          echo "Usually a truncated download. The file has been left for inspection;"
+          echo "delete $TILES_DIR/$TILES_FILE and re-run to retry."
+          exit 1
+        fi
+        echo "Basemap ready: $(du -h "$TILES_DIR/$TILES_FILE" | cut -f1)"
+      fi
+    - |
+      # NEXT_PUBLIC_* have to reach the BUILD, not just the runtime: Next inlines
+      # them into the client bundle. Passed as build args rather than left to
+      # compose's environment, which only reaches the running container.
+      docker compose -p gratitude-app -f docker-compose.prod.yml -f docker-compose.hub.yml build \
+        --build-arg NEXT_PUBLIC_SUPABASE_URL="$NEXT_PUBLIC_SUPABASE_URL" \
+        --build-arg NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY="$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY"
+      docker compose -p gratitude-app -f docker-compose.prod.yml -f docker-compose.hub.yml up -d
+    - |
+      # Schema changes are NOT applied from here.
+      #
+      # There is no `migrate` service any more: migrations live in
+      # supabase/migrations and are applied to the project with
+      # `supabase db push`, which needs an access token this runner does not
+      # have and should not have — a deploy job that can rewrite the schema of
+      # a live database is a bad trade for the convenience.
+      #
+      # So: apply migrations first, from a machine with the token, then deploy.
+      # The health check below is what catches a deploy that ran ahead of its
+      # schema, because it queries a real table rather than pinging a socket.
+      echo 'Schema is managed out-of-band: npx supabase db push --linked'
+    - |
+      # The gate the old pipeline was missing: prove it actually answers.
+      for i in $(seq 1 30); do
+        code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:30083/api/health || true)
+        if [ "$code" = "200" ]; then
+          echo "health check OK"
+          exit 0
+        fi
+        sleep 2
+      done
+      echo "FATAL: /api/health did not return 200 — deploy is broken."
+      docker compose -p gratitude-app -f docker-compose.prod.yml -f docker-compose.hub.yml logs --tail=40 web
+      exit 1
+  environment:
+    name: production
+    url: https://gratitude.brainlessbrilliance.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

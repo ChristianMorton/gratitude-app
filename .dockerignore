@@ -1,0 +1,26 @@
+# The basemap archive is ~1GB and lives on the host at /opt/pmtiles, bind-mounted
+# read-only into nginx. This entry exists BEFORE the file could ever be here: if a
+# .pmtiles ever lands in the build context, `docker build` ships a gigabyte to the
+# daemon and the deploy hangs or fills the disk.
+public/tiles/
+*.pmtiles
+
+node_modules
+.git
+.env*
+!.env.example
+
+# Build output. `.next-e2e` is the e2e run's distDir (see next.config.ts) and is
+# ~331MB — Docker patterns are literal, so `.next` does NOT cover it.
+.next
+.next-e2e
+
+uploads
+coverage
+*.png
+.claude
+
+# NOTE: `tests/` is deliberately NOT ignored. CI runs the privacy suite inside the
+# `builder` stage (the runner box has Node 18; this app needs 24), so the tests
+# have to be in the context. They never reach the runtime image — the `runner`
+# stage copies only the standalone build.

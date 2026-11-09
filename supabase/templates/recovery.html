@@ -1,0 +1,25 @@
+<!--
+  Password reset email.
+
+  The default template uses {{ .ConfirmationURL }}, which is the implicit flow:
+  it puts the tokens in a URL fragment for a browser to read. This app verifies
+  on the server, so it needs the PKCE shape instead — a {{ .TokenHash }} that
+  /auth/confirm exchanges for a session.
+
+  {{ .RedirectTo }} and not {{ .SiteURL }}: SiteURL is fixed at 127.0.0.1:3000,
+  but the e2e suite runs the app on :3100, and a link that always points at one
+  port cannot be tested on the other. RedirectTo is whatever the app asked for,
+  and it already carries ?next=, so the extra params append with &.
+-->
+<h2>Reset your password</h2>
+
+<p>Someone asked to reset the password for your Gratitude account. If that wasn't
+  you, nothing has changed — you can ignore this and carry on.</p>
+
+<p>
+  <a href="{{ .RedirectTo }}&token_hash={{ .TokenHash }}&type=recovery">
+    Choose a new password
+  </a>
+</p>
+
+<p>This link can only be used once, and expires in an hour.</p>

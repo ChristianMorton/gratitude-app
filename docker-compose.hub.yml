@@ -1,0 +1,5 @@
+# hub (apps user, rootless docker): port range 30000-30999, loopback only.
+services:
+  nginx:
+    ports: !override
+      - '127.0.0.1:30083:80'

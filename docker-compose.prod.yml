@@ -1,0 +1,73 @@
+# The project name is the volume namespace prefix. It must NEVER be `gratitude`:
+# that is the old stack's name, and reusing it would resolve old volumes silently.
+# Hence `gratitude-app`.
+name: gratitude-app
+
+# There is no database here any more, and no uploads volume.
+#
+# Postgres, auth and photo storage all live in the Supabase project now. What
+# runs on this host is the app and the nginx in front of it — plus the basemap,
+# which is the one thing that deliberately did NOT move: tiles are self-hosted so
+# that no third party learns which coordinates a user is looking at, and that
+# argument is unchanged by where the database went.
+#
+# The old `postgres_data` and `uploads` volumes are no longer referenced. They
+# still exist on the host, holding the previous stack's accounts and photos.
+# Nothing here reads them. Remove them by hand once you're sure nothing is wanted
+# — this file no longer will, and `docker compose down -v` on the old project
+# name is a one-way door.
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Public by design: these are shipped to the browser. The publishable key
+      # is safe there — RLS protects the data, not the key.
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?NEXT_PUBLIC_SUPABASE_URL is required}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:?NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is required}
+      # Server-only. Bypasses RLS entirely, so it must never reach the browser —
+      # which is exactly what the missing NEXT_PUBLIC_ prefix guarantees.
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:?SUPABASE_SECRET_KEY is required}
+      NODE_ENV: production
+    # Opt into the shared observability stack. The apps-box satellite collector
+    # discovers containers by these labels off the Docker socket — no network
+    # join needed (osint-map reports the same way). Namespace is the Loki
+    # grouping the public status panel keys on (allowlisted as
+    # `gratitude:Gratitude`); it's a log label, unrelated to the `gratitude-app`
+    # compose project name above.
+    #
+    # `web` is labelled for app-level errors, but Next.js in production emits
+    # almost nothing per request — the traffic signal lives in nginx's access
+    # log (see nginx below). Both roll up under one `gratitude` namespace.
+    labels:
+      obs.service.name: 'web'
+      obs.service.namespace: 'gratitude'
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    # The traffic signal. nginx logs every request; the panel's "log lines" is
+    # this. Access-log 404s from bot probes count as traffic, not errors — they
+    # carry no error LEVEL, so the stack's level-aware counter leaves them out
+    # of the error rate. Single-homed with a published port, so it does not trip
+    # the docker_observer receiver flap that multi-homed containers do.
+    labels:
+      obs.service.name: 'nginx'
+      obs.service.namespace: 'gratitude'
+    depends_on:
+      - web
+    ports:
+      # Bound to loopback deliberately. The old stack published 0.0.0.0:8082,
+      # which left it reachable on the raw public IP, bypassing Cloudflare.
+      # The host nginx is the only way in.
+      - '127.0.0.1:8083:80'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Host bind mount, read-only. Not a named volume — that would mean copying
+      # 17GB on every stack rebuild — and not baked into the image, which is what
+      # .dockerignore is guarding. CI provisions this directory; it needs no root
+      # because the runner owns it.
+      - ${TILES_DIR:-/home/gitlab-runner/pmtiles}:/srv/tiles:ro
